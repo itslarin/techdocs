@@ -1,0 +1,297 @@
+@startuml
+|Filenet|
+|KRG|
+
+
+|Filenet|
+start
+
+:HTTP.GET: /filenet/publication/do/download/cabinetId/{cabinetId}/stream/{contentId};
+
+note right
+  * <b>cabinetId</b> - PathVariable
+  * <b>contentId</b> - PathVariable (same as attachmentId)
+  * <b>x-start-offset</b> - Request Header
+  * <b>x-end-offset</b> - Request Header
+  ====
+  ! данный эндпоинт не требует авторизации
+end note
+
+
+:инициализируем переменные значениями: 
+
+  <b>chunkSize</b> = endOffset - startOffset
+  <b>chunkNum</b> = 0
+  <b>chunkToCheck</b> = 0;
+
+
+:<b>webFileDescriptor</b> = webFileSessionStorage.get(String.valueOf(contentId));
+
+
+if (\n webFileDescriptor != null \n)
+
+  partition #LightGrey дескриптор файла существует {  
+
+    if (\n webFileDescriptor.getChunkContext() != null 
+        && 
+        webFileDescriptor.getChunkContext().getError().size() > 0 \n)
+
+      partition #pink контекст чанков содержит ошибки {
+
+        :ChunksFileDownloader.cleanupChunks();
+
+        :feedNotificationClient
+          .sendFeedNotification(); 
+        note right    
+          отправляем сообщение в кабинет КРГ об ошибке
+          (посредством feign клиент);
+        end note
+
+    
+        |KRG|
+        :создаем уведомление K014;
+
+
+        |Filenet|
+        #orange:return ResponseEntity 
+          with x-stop and x-message headers;
+        note right    
+          Возвращаем ответ с кодом 200, пустым телом, 
+          заголовком x-stop (восстанавливаемая ошибка) 
+          и x-message=сообщение об ошибке из контекста чанков
+        end note
+
+
+        stop
+        note right    
+          Выход в восстанавливаемую ошибку 
+          (все ошибки с чанками предполагают возможность восстановления)
+        end note
+
+      }  
+
+    endif
+  
+
+    :устанавливаем значения для переменных:
+
+      <b>chunkNum</b> = startOffset / webFileDescriptor.getChunkSize()
+      <b>chunkToCheck</b> = Math.max(chunkNum - 1, chunkToCheck);
+
+
+  }
+
+
+endif
+
+
+if (\n webFileDescriptor == null \n || \n StringUtils.isEmpty(webFileDescriptor.getStorage()) \n)
+
+  :<b>chunk</b> = null;
+else
+  :<b>chunk</b> = chunkFileDownloader.getChunkByIndex(..., chunkToCheck);
+endif
+
+
+if (\n webFileDescriptor == null \n || \n StringUtils.isEmpty(webFileDescriptor.getStorage()) \n || \n chunk == null \n)
+
+
+  partition #LightGrey Дескриптор файла не существует или искомый чанк отсутствует {
+
+    :<b>attachment</b> = attachmentService.doAntivirusScanning(contentId, ...);
+
+
+    if (\n attachment == null \n) 
+
+      partition #pink Файл не найден по contentId {
+
+        #Red:throw new NotFoundException(File with attachment id %contentId% not found);
+
+        end
+      }
+
+    endif
+
+
+    :downloadAttachment(attachment, ...);
+  }
+
+
+endif
+
+
+:<b>webFileDescriptor</b> = webFileSessionStorage.get(String.valueOf(contentId));
+
+
+if (\n webFileDescriptor.getStreamProcessor() != null \n && \n webFileDescriptor.getStreamSupplier() == null \n)
+
+  partition #LightGrey есть processor, нет supplier {
+
+    :<b>webFileDescriptor</b> = convertStreamProcessorToSupplierChunked(webFileDescriptor, chunkSize);
+
+
+    :<b>webFileDescriptor</b>.getChunkContext().setCompleted(false);
+
+
+    :chunkFileDownloader.prepareFile();
+
+
+    fork
+
+      :<b>webFileSessionStorage</b>.put(webFileDescriptor);
+
+
+    fork again;
+
+      partition #White Генерация чанков (асинхронный процесс) {
+  
+        :создаем чанки в порядке возрастания;
+
+        if (в процессе создания возникла ошибка)
+          partition #pink Ошибка при создании чанков {
+            :<b>webFileDescriptor</b>.getContext.setError(error);  
+            end
+          }
+        else
+          #PaleGreen:<b>webFileDescriptor</b>.getChunkContext().setCompleted(true);
+          end
+        endif
+
+      }
+
+    end fork
+
+  }
+
+endif
+
+
+
+:<b>chunkNum</b> = startOffset / webFileDescriptor.getChunkSize();
+
+
+if (webFileDescriptor.getStreamSupplier() != null) 
+
+  partition #LightGrey stream supplier существует {
+    
+    :<b>chunk</b> = chunkFileDownloader.getChunkByIndex(..., chunkNum);
+
+    
+    if (\n chunk == null \n || \n !chunk.exists() \n)
+
+      partition #White Запрашиваемый отсутствует {
+
+        if (webFileDescriptor.getChunkContext() != null && webFileDescriptor.getChunkContext().isCompleted()) 
+
+          partition #LightGrey Контекст чанков отмечен как завершенный {
+
+            if (webFileDescriptor.getStreamProcessor() == null)
+
+              partition #White отсутствует stream processor {
+
+
+                :<b>attachment</b> = attachmentService.doAntivirusScanning(contentId, ...);
+
+
+                if (\n attachment == null \n) 
+
+                  partition #pink Файл не найден по contentId {
+
+                    #Red:throw new NotFoundException(File with attachment id %contentId% not found);
+ 
+
+                    end
+                  }
+
+                endif
+
+
+                :downloadAttachment(attachment, ...);
+
+                :<b>webFileDescriptor</b> = webFileSessionStorage.get(String.valueOf(contentId));
+
+              }
+
+            endif
+
+
+            :<b>webFileDescriptor</b> = convertStreamProcessorToSupplierChunked(webFileDescriptor, chunkSize);
+
+
+            :<b>webFileDescriptor</b>.getChunkContext().setCompleted(false);
+
+
+            :chunkFileDownloader.prepareFile();
+
+
+            fork
+
+            :<b>webFileSessionStorage</b>.put(webFileDescriptor);
+
+
+            fork again;
+
+            partition #White Генерация чанков (асинхронный процесс) {
+  
+              :создаем чанки в порядке возрастания;
+
+              if (в процессе создания возникла ошибка)
+                partition #pink Ошибка при создании чанков {
+                  :<b>webFileDescriptor</b>.getContext.setError(error);  
+                  end
+                }
+              else
+                #PaleGreen:<b>webFileDescriptor</b>.getChunkContext().setCompleted(true);
+                end
+              endif
+
+            } 
+
+            end fork
+
+          }
+
+        endif
+        
+
+        if (\n webFileDescriptor.getXDelayCounter().intValue() < 3 \n)
+          
+          :<b>webFileDescriptor</b>.getXDelayCounter().incrementAndGet();
+
+
+          #Orange:return ResponseEntity
+            with x-delay and x-message headers;
+          stop
+
+        else
+
+          :<b>webFileDescriptor</b>.getXDelayCounter().set(0);
+
+
+          #Orange:return ResponseEntity
+            with x-stop and x-message headers;
+          stop
+
+        endif
+
+      }
+           
+    endif
+
+
+    #PaleGreen:return ResponseEntity with chunk;
+    end
+
+  }
+
+else
+  #Red:throw new 
+    NotFoundException("Контекст файла недоступен.");
+  end
+endif
+
+
+
+
+stop
+@enduml
